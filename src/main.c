@@ -287,7 +287,12 @@ void wifi_task(void *pvParameters) {
 }
 
 void led_task(void *pvParameters) {
-    while (true) { cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1); vTaskDelay(pdMS_TO_TICKS(100)); cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0); vTaskDelay(pdMS_TO_TICKS(900)); }
+    while (true) { 
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1); 
+        vTaskDelay(pdMS_TO_TICKS(100)); 
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0); 
+        vTaskDelay(pdMS_TO_TICKS(900)); 
+    }
 }
 
 int main() {
