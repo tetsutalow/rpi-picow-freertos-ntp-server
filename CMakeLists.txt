@@ -24,7 +24,7 @@ add_executable(ntp_server
     ${FREERTOS_KERNEL_PATH}/portable/MemMang/heap_4.c
 )
 target_include_directories(ntp_server PRIVATE src . ${FREERTOS_KERNEL_PATH}/include ${FREERTOS_KERNEL_PATH}/portable/ThirdParty/GCC/RP2040/include)
-target_link_libraries(ntp_server pico_stdlib pico_cyw43_arch_lwip_sys_freertos hardware_flash)
+target_link_libraries(ntp_server pico_stdlib pico_cyw43_arch_lwip_sys_freertos hardware_flash hardware_rtc)
 pico_add_extra_outputs(ntp_server)
 pico_enable_stdio_usb(ntp_server 1)
 pico_enable_stdio_uart(ntp_server 0)
