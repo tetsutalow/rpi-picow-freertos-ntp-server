@@ -11,6 +11,7 @@
 #include "hardware/sync.h"
 #include "hardware/gpio.h"
 #include "pico/cyw43_arch.h"
+#include "pico/stdio_usb.h"
 
 #include "hardware/irq.h"
 #include "FreeRTOS.h"
@@ -49,6 +50,7 @@ typedef struct {
     uint64_t last_pps_pico_us;
     int32_t pps_pico_us_diff;
     uint32_t utc_seconds;
+    uint32_t last_pps_seconds;
     struct tm utc_tm;
     int fix_quality;
     int num_satellites;
@@ -57,7 +59,7 @@ typedef struct {
     bool ntp_active;
 } ntp_sync_t;
 
-static ntp_sync_t sync_data = {0, 0, 0, {0, 0, 0, 0}, 0, 0, {"", "", "", ""}, 0, false};
+static ntp_sync_t sync_data = {0};
 static SemaphoreHandle_t sync_mutex;
 static TaskHandle_t led_task_handle;
 static QueueHandle_t uart_rx_queue;
@@ -83,7 +85,10 @@ void pps_callback(uint gpio, uint32_t events) {
     if (xSemaphoreTakeFromISR(sync_mutex, &xHigherPriorityTaskWoken) == pdTRUE) {
         sync_data.pps_pico_us_diff = (int32_t)(now - sync_data.last_pps_pico_us);
         sync_data.last_pps_pico_us = now;
-        sync_data.utc_seconds++;
+        if (sync_data.utc_seconds == sync_data.last_pps_seconds) { // MNEAより先にPPSが来たら
+            sync_data.utc_seconds++;
+        }
+        sync_data.last_pps_seconds = sync_data.utc_seconds;
         xSemaphoreGiveFromISR(sync_mutex, &xHigherPriorityTaskWoken);
     }
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
@@ -100,7 +105,6 @@ static void ntp_recv_raw(void *arg, struct udp_pcb *pcb, struct pbuf *p, const i
             int fix = sync_data.fix_quality;
             uint32_t sec = sync_data.utc_seconds;
             uint64_t pps_us = sync_data.last_pps_pico_us;
-            int32_t pps_us_diff = sync_data.pps_pico_us_diff;
             xSemaphoreGive(sync_mutex);
             if (fix == 0) {
                 datetime_t t;
@@ -119,7 +123,7 @@ static void ntp_recv_raw(void *arg, struct udp_pcb *pcb, struct pbuf *p, const i
                 memset(resp, 0, NTP_MSG_LEN);
 
                 uint64_t now_us = time_us_64();
-                uint64_t diff_us = (fix > 0) ? (now_us - pps_us) : (now_us - pps_us) % 1000000; // GPSが固定されていない場合はPPSのタイミングを考慮する
+                uint64_t diff_us = (fix > 0) ? (now_us - pps_us) : (now_us - pps_us) % 1000000; // GPSが固定されていない場合はPPSを取り逃がしている可能性があるので
                 
                 // NTP Header
                 // LI=0 (no warning), VN=from client, Mode=4 (server)
@@ -189,7 +193,7 @@ const char *HTTP_BODY_TPL =
     "<div class='box'><b>NTP Server:</b> %s</div>"
     "<div class='box'><b>GPS Fix:</b> %d | Sats: %d | Total NMEA: %d</div>"
     "<div class='box'><b>Current Pico Time:</b> %llu | diff = %d</div>"
-    "<div class='box'><b>Last GPS Time:</b> %s</div>"
+    "<div class='box'><b>Last GPS Time:</b> %s | RTC: %s</div>"
     "<div class='box'><b>Network:</b> %s | %s</div>"
     "<div class='box'><pre style='font-size:10px;'>%s\n%s\n%s\n%s</pre></div>"
     "</body></html>";
@@ -206,13 +210,17 @@ void http_server_task(void *pvParameters) {
         if (client_sock >= 0) {
             char req[512]; recv(client_sock, req, sizeof(req), 0); // クライアントからのリクエストを受信
             char last_time_str[64]; // 最終取得のGPS時刻を文字列にして格納するバッファ
-
+            datetime_t t;
+            char rtc_time_str[64]; // RTCの時刻を文字列にして格納するバッファ
+            rtc_get_datetime(&t);
+            datetime_to_str(rtc_time_str, 64, &t);                
+            
             xSemaphoreTake(sync_mutex, portMAX_DELAY);
             strftime(last_time_str, sizeof(last_time_str), "%Y-%m-%d %H:%M:%S UTC", &sync_data.utc_tm);                
             int body_len = snprintf(http_response + 512, 2500, HTTP_BODY_TPL, 
                      (sync_data.ntp_active ? (sync_data.fix_quality > 0 ? "Stratum 1 Active" : "Waiting for GPS Fix") : "NTP Init Failed"),
                      sync_data.fix_quality, sync_data.num_satellites, sync_data.sentence_count,
-                     sync_data.last_pps_pico_us, sync_data.pps_pico_us_diff, last_time_str,
+                     sync_data.last_pps_pico_us, sync_data.pps_pico_us_diff, last_time_str, rtc_time_str,
                      ssid_copy, ip4addr_ntoa(netif_ip4_addr(netif_default)),
                      sync_data.raw_nmea[(sync_data.sentence_count - 1) % 4], sync_data.raw_nmea[(sync_data.sentence_count - 2) % 4], 
                      sync_data.raw_nmea[(sync_data.sentence_count - 3) % 4], sync_data.raw_nmea[(sync_data.sentence_count) % 4]);
@@ -231,50 +239,50 @@ void parse_nmea_sentence(char *sentence) {
     strncpy(sync_data.raw_nmea[sync_data.sentence_count % 4], sentence, 127); // 0-3のいずれかに書き込まれる
     sync_data.sentence_count++;
     xSemaphoreGive(sync_mutex);
-    // $GxRMCのフォーマットは $GPRMC,hhmmss.sss,A,ddmm.mmmm,N,dddmm.mmmm,E,v,ss,ddmmyy,ddd.d,E,A*hh
-    //                        00000000001111111111222222222233333333334444444444555555555566666666
-    //                        01234567890123456789001234567890012345678900123456789001234567890012
-    if ((strncmp(sentence, "$GPRMC", 6) == 0) || (strncmp(sentence, "$GNRMC", 6) == 0)) {
-        int valid = 0; int field = 0;
-        char *time_str_p = NULL; char *date_str_p = NULL; char *p = sentence;
-        printf("%s\n", sentence); // debug
-        while ((p = strchr(p, ',')) != NULL) {
-            field++;
-            p++;
-            if (field == 1) {
-                time_str_p = p;         // hhmmss.sss
+    if (sentence[0] == '$' && sentence[1] == 'G') {
+        // $GxRMCのフォーマットは $GxRMC,hhmmss.sss,A,ddmm.mmmm,N,dddmm.mmmm,E,v,ss,ddmmyy,ddd.d,E,A*hh
+        if (sentence[3] == 'R' && sentence[4] == 'M' && sentence[5] == 'C') {
+            xTaskNotify(led_task_handle, EVENT_NMEA, eSetBits);
+            int valid = 0; int field = 0;
+            char *time_str_p = NULL; char *date_str_p = NULL; char *p = sentence;
+            while ((p = strchr(p, ',')) != NULL) {
+                field++;
+                p++;
+                if (field == 1) {
+                    time_str_p = p;         // hhmmss.sss
+                }
+                if (field == 2) {
+                    valid = (p[0] == 'A');  // Aなら有効 Vなら無効
+                }
+                if (field == 9) {
+                    date_str_p = p;         // ddmmyy
+                }
             }
-            if (field == 2) {
-                valid = (p[0] == 'A');  // Aなら有効 Vなら無効
+            if (time_str_p != NULL && date_str_p != NULL) {
+                struct tm t; 
+                memset(&t, 0, sizeof(t));
+                xSemaphoreTake(sync_mutex, portMAX_DELAY);
+#define d2_to_i(p) ((*(p)-'0')*10 + (*(p+1)-'0')) // 2桁の数字をintに変換
+                t.tm_mday = d2_to_i(date_str_p);
+                t.tm_mon = d2_to_i(date_str_p+2) - 1;
+                t.tm_year = d2_to_i(date_str_p+4) + 100;
+                t.tm_hour = d2_to_i(time_str_p);
+                t.tm_min = d2_to_i(time_str_p+2);
+                t.tm_sec = d2_to_i(time_str_p+4);
+                sync_data.utc_seconds = (uint32_t)mktime(&t);
+                sync_data.utc_tm = t;
+                xSemaphoreGive(sync_mutex);
             }
-            if (field == 9) {
-                date_str_p = p;         // ddmmyy
-            }
-        }
-        if (time_str_p != NULL && date_str_p != NULL) {
-            struct tm t; 
-            memset(&t, 0, sizeof(t));  char b[3] = {0};
+        } else if (sentence[3] == 'G' && sentence[4] == 'G' && sentence[5] == 'A') {
+            char tmp[128]; strncpy(tmp, sentence, 127); char *p = tmp; char *token; int field = 0;
             xSemaphoreTake(sync_mutex, portMAX_DELAY);
-            b[0] = date_str_p[0]; b[1] = date_str_p[1]; t.tm_mday = atoi(b);
-            b[0] = date_str_p[2]; b[1] = date_str_p[3]; t.tm_mon = atoi(b) - 1;
-            b[0] = date_str_p[4]; b[1] = date_str_p[5]; t.tm_year = atoi(b) + 100;
-            b[0] = time_str_p[0]; b[1] = time_str_p[1]; t.tm_hour = atoi(b);
-            b[0] = time_str_p[2]; b[1] = time_str_p[3]; t.tm_min = atoi(b);
-            b[0] = time_str_p[4]; b[1] = time_str_p[5]; t.tm_sec = atoi(b);
-            sync_data.utc_seconds = (uint32_t)mktime(&t);
-            sync_data.utc_tm = t;
+            while ((token = strsep(&p, ",")) != NULL) {
+                if (field == 6) sync_data.fix_quality = atoi(token);
+                if (field == 7) sync_data.num_satellites = atoi(token);
+                field++;
+            }
             xSemaphoreGive(sync_mutex);
         }
-    }
-    if (strncmp(sentence, "$GPGGA", 6) == 0 || strncmp(sentence, "$GNGGA", 6) == 0) {
-        char tmp[128]; strncpy(tmp, sentence, 127); char *p = tmp; char *token; int field = 0;
-        xSemaphoreTake(sync_mutex, portMAX_DELAY);
-        while ((token = strsep(&p, ",")) != NULL) {
-            if (field == 6) sync_data.fix_quality = atoi(token);
-            if (field == 7) sync_data.num_satellites = atoi(token);
-            field++;
-        }
-        xSemaphoreGive(sync_mutex);
     }
 }
 
@@ -290,7 +298,6 @@ void gps_task(void *pvParameters) {
                     line_buf[pos] = '\0';
                     if (pos > 5) {
                         parse_nmea_sentence(line_buf);
-                        xTaskNotify(led_task_handle, EVENT_NMEA, eSetBits);
                     }
                     pos = 0;
                 }
@@ -365,6 +372,7 @@ void led_task(void *pvParameters) {
         if (xTaskNotifyWait(0, ULONG_MAX, &notifiedValue, portMAX_DELAY) == pdTRUE) {
             cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1); 
             if (notifiedValue & EVENT_PPS) {
+//                printf("PPS detected: now=%llu, diff=%d, utc_seconds=%d, last_pps_seconds=%d\n", time_us_64(), sync_data.pps_pico_us_diff, sync_data.utc_seconds, sync_data.last_pps_seconds);
                 vTaskDelay(pdMS_TO_TICKS(50)); 
             } else if (notifiedValue & EVENT_NTP_RECV) {
                 vTaskDelay(pdMS_TO_TICKS(100)); 
@@ -378,6 +386,16 @@ void led_task(void *pvParameters) {
 
 int main() {
     stdio_init_all(); 
+
+    // USBシリアル接続を最大5秒待避
+    for (int i = 0; i < 50; i++) {
+        if (stdio_usb_connected()) {
+            sleep_ms(500); // 接続直後の安定のために少し待機
+            break;
+        }
+        sleep_ms(100);
+    }
+
     uart_init(UART_ID, BAUD_RATE); gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART); gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
     
     // Setup UART RX Interrupt
@@ -390,7 +408,22 @@ int main() {
     rtc_init(); // RTCを初期化
 
     gpio_init(PPS_PIN); gpio_set_dir(PPS_PIN, GPIO_IN);
-    gpio_set_irq_enabled_with_callback(PPS_PIN, GPIO_IRQ_EDGE_RISE, true, &pps_callback);
+
+    printf("Detecting PPS edge...\n");
+    int high_count = 0;
+    int low_count = 0;
+    for (int i = 0; i < 10; i++) {
+        if (gpio_get(PPS_PIN)) {
+            high_count++;
+        } else {
+            low_count++;
+        }
+        sleep_ms(100);
+    }
+
+    uint32_t irq_edge = (high_count > low_count) ? GPIO_IRQ_EDGE_FALL : GPIO_IRQ_EDGE_RISE;
+    printf("High=%d, Low=%d, Detected edge: %s\n", high_count, low_count, (irq_edge == GPIO_IRQ_EDGE_FALL) ? "Falling" : "Rising");
+    gpio_set_irq_enabled_with_callback(PPS_PIN, irq_edge, true, &pps_callback);
     sync_mutex = xSemaphoreCreateMutex();
     xTaskCreate(led_task, "LED", 256, NULL, 1, &led_task_handle);
     xTaskCreate(wifi_task, "Wi-Fi", 4096, NULL, 2, NULL);
