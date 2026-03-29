@@ -21,6 +21,7 @@
 
 #include "lwip/udp.h"
 #include "lwip/sockets.h"
+#include "lwip/dhcp.h"
 
 // GPS & PPS
 #define UART_ID uart0
@@ -36,13 +37,16 @@
 
 // Flash
 #define FLASH_TARGET_OFFSET (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
-#define WIFI_CONFIG_MAGIC 0x57494649
+#define WIFI_CONFIG_MAGIC 0x5749464A
 
 typedef struct {
     uint32_t magic;
     char ssid[33];
     char password[64];
     uint32_t auth_mode;
+    uint32_t ip_addr;
+    uint32_t netmask;
+    uint32_t gateway;
 } wifi_config_t;
 
 // NTP Sync State
@@ -306,9 +310,10 @@ void gps_task(void *pvParameters) {
     }
 }
 
-void save_wifi_config(const char *ssid, const char *password, uint32_t auth) {
+void save_wifi_config(const char *ssid, const char *password, uint32_t auth, uint32_t ip, uint32_t nm, uint32_t gw) {
     wifi_config_t config; memset(&config, 0, sizeof(config));
     config.magic = WIFI_CONFIG_MAGIC; strncpy(config.ssid, ssid, 32); strncpy(config.password, password, 63); config.auth_mode = auth;
+    config.ip_addr = ip; config.netmask = nm; config.gateway = gw;
     uint8_t buffer[FLASH_PAGE_SIZE]; memset(buffer, 0, sizeof(buffer)); memcpy(buffer, &config, sizeof(config));
     uint32_t ints = save_and_disable_interrupts();
     flash_range_erase(FLASH_TARGET_OFFSET, FLASH_SECTOR_SIZE); flash_range_program(FLASH_TARGET_OFFSET, buffer, FLASH_PAGE_SIZE);
@@ -322,9 +327,16 @@ bool load_wifi_config(wifi_config_t *config) {
 void get_line_with_timeout(char *buffer, int max_len, uint32_t timeout_ms) {
     int i = 0; absolute_time_t end_time = make_timeout_time_ms(timeout_ms);
     while (i < max_len - 1) {
-        if (time_reached(end_time)) { buffer[0] = '\0'; return; }
+        if (time_reached(end_time)) { buffer[i] = '\0'; return; }
         int c = getchar_timeout_us(100000); if (c == PICO_ERROR_TIMEOUT) continue;
-        if (c == '\r' || c == '\n') { if (i == 0) continue; buffer[i] = '\0'; printf("\r\n"); break; }
+        if (c == '\r' || c == '\n') { 
+            buffer[i] = '\0'; printf("\r\n"); 
+            if (c == '\r') {
+                int next = getchar_timeout_us(10000); // consume paired \n if any
+                (void)next; // prevent compiler warning
+            }
+            break; 
+        }
         else if (c == 8 || c == 127) { if (i > 0) { i--; printf("\b \b"); } }
         else if (c >= 32 && c <= 126) { buffer[i++] = c; putchar(c); end_time = at_the_end_of_time; }
     }
@@ -337,14 +349,60 @@ void wifi_task(void *pvParameters) {
     while (true) {
         printf("\nSSID (wait 10s): ");
         char target_ssid[33] = {0}; char target_pass[64] = {0}; uint32_t target_auth = CYW43_AUTH_WPA2_MIXED_PSK;
+        uint32_t target_ip = 0, target_nm = 0, target_gw = 0;
         get_line_with_timeout(target_ssid, sizeof(target_ssid), 10000);
-        if (target_ssid[0] == '\0' && has_saved) { strncpy(target_ssid, saved_config.ssid, 32); strncpy(target_pass, saved_config.password, 63); target_auth = saved_config.auth_mode; }
-        else if (target_ssid[0] != '\0') { printf("Pass: "); get_line_with_timeout(target_pass, sizeof(target_pass), 60000); }
+        if (target_ssid[0] == '\0' && has_saved) { 
+            strncpy(target_ssid, saved_config.ssid, 32); strncpy(target_pass, saved_config.password, 63); target_auth = saved_config.auth_mode; 
+            target_ip = saved_config.ip_addr; target_nm = saved_config.netmask; target_gw = saved_config.gateway;
+        }
+        else if (target_ssid[0] != '\0') { 
+            printf("Pass: "); get_line_with_timeout(target_pass, sizeof(target_pass), 60000); 
+            printf("IP/Mask (IPv4, e.g. 192.168.0.10/24, empty or 0.0.0.0 for DHCP): ");
+            char ip_str[32] = {0}; get_line_with_timeout(ip_str, sizeof(ip_str), 60000);
+            if (ip_str[0] == '\0' || strcmp(ip_str, "0.0.0.0") == 0) {
+                target_ip = 0; target_nm = 0; target_gw = 0;
+            } else {
+                char *slash = strchr(ip_str, '/');
+                int prefix = 24;
+                if (slash != NULL) { *slash = '\0'; prefix = atoi(slash + 1); }
+                ip4_addr_t ipaddr;
+                if (!ip4addr_aton(ip_str, &ipaddr) || ipaddr.addr == 0) {
+                    target_ip = 0; target_nm = 0; target_gw = 0;
+                } else {
+                    target_ip = ipaddr.addr;
+                    uint32_t mask = (prefix == 0) ? 0 : (~0U << (32 - prefix));
+                    target_nm = htonl(mask);
+                    printf("Gateway (IPv4, e.g. 192.168.0.1): ");
+                    char gw_str[32] = {0}; get_line_with_timeout(gw_str, sizeof(gw_str), 60000);
+                    ip4_addr_t gwaddr;
+                    if (!ip4addr_aton(gw_str, &gwaddr) || gwaddr.addr == 0) {
+                        target_gw = 0;
+                    } else {
+                        target_gw = gwaddr.addr;
+                    }
+                }
+            }
+        }
         else continue;
+        
+        cyw43_arch_lwip_begin();
+        if (target_ip != 0) {
+            ip4_addr_t ip, nm, gw;
+            ip.addr = target_ip; nm.addr = target_nm; gw.addr = target_gw;
+            dhcp_stop(netif_default);
+            netif_set_addr(netif_default, &ip, &nm, &gw);
+            netif_set_up(netif_default);
+        } else {
+            dhcp_start(netif_default);
+            netif_set_up(netif_default);
+        }
+        cyw43_arch_lwip_end();
+
         printf("Connecting to %s...\n", target_ssid);
         if (!cyw43_arch_wifi_connect_timeout_ms(target_ssid, target_pass, target_auth, 30000)) {
             while (ip4_addr_isany_val(*netif_ip4_addr(netif_default))) vTaskDelay(pdMS_TO_TICKS(100));
-            save_wifi_config(target_ssid, target_pass, target_auth);
+            printf("\nConnected. IP Address: %s\n", ip4addr_ntoa(netif_ip4_addr(netif_default)));
+            save_wifi_config(target_ssid, target_pass, target_auth, target_ip, target_nm, target_gw);
             static char active_ssid[33]; strncpy(active_ssid, target_ssid, 32);
             xTaskCreate(http_server_task, "HTTP", 4096, (void*)active_ssid, 2, NULL);
             start_ntp_server_raw();
