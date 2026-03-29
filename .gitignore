@@ -8,3 +8,5 @@ build/
 *.map
 *.dis
 walkthrough.md
+FreeRTOS-Kernel/
+pico-sdk/
